@@ -5,6 +5,7 @@ import asyncio
 import threading
 import tempfile
 import re
+import shutil
 from collections import deque
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -38,7 +39,6 @@ current_encoding = {}
 # ================= UTILS =================
 
 def is_authorized(message: Message) -> bool:
-    """Check if user is allowed. Ignore everyone else completely."""
     if not message.from_user: return False
     u_id = message.from_user.id    
     if u_id == OWNER_ID or u_id in ALLOWED_USERS or message.chat.id in ALLOWED_GROUPS:
@@ -94,28 +94,63 @@ async def download_with_verification(client, file_id, status_msg, phase="Downloa
             raise Exception(f"Download failed: {str(e)}")
     raise Exception("Download failed after 5 attempts")
 
+# ================= FINAL ENCODE FUNCTION (ALL FIXES + FAST) =================
 async def encode_with_progress(video_path, subtitle_path, output_path, total_duration, status_msg, user_id, wm_path=None, wm_pos=None):
-    # Absolute path for FFmpeg safety (Linux/Colab)
-    abs_sub = os.path.abspath(subtitle_path).replace('\\', '/')
+    # ---------- FIX 1: Preserve original subtitle extension ----------
+    ext = os.path.splitext(subtitle_path)[1]  # .srt or .ass
+    safe_sub = os.path.join(tempfile.gettempdir(), f"subtitle{ext}")
+    try:
+        shutil.copy(subtitle_path, safe_sub)
+    except:
+        safe_sub = subtitle_path   # fallback agar copy fail ho
     
-    cmd = ["ffmpeg", "-y", "-i", video_path]
+    abs_sub = os.path.abspath(safe_sub).replace('\\', '/')
+    
+    # Base command with mapping and faststart
+    base_cmd = ["ffmpeg", "-y", "-i", video_path, "-map", "0"]
+    
+    # Subtitle filter with UTF-8
+    sub_filter = f"subtitles='{abs_sub}':charenc=UTF-8"
     
     if wm_path:
-        # WATERMARK + SUBTITLE (Fixed height 60px, auto width)
-        cmd.extend(["-i", wm_path])
+        base_cmd.extend(["-i", wm_path])
         pos_x, pos_y = ("10", "10") if wm_pos == "TL" else ("W-w-10", "10")
-        filter_str = f"[0:v]subtitles='{abs_sub}'[sub];[1:v]scale=-1:60[wm];[sub][wm]overlay={pos_x}:{pos_y}"
-        cmd.extend(["-filter_complex", filter_str])
+        filter_str = f"[0:v]{sub_filter}[sub];[1:v]scale=-1:60[wm];[sub][wm]overlay={pos_x}:{pos_y}"
+        base_cmd.extend(["-filter_complex", filter_str])
     else:
-        # ONLY SUBTITLE
-        cmd.extend(["-vf", f"subtitles='{abs_sub}'"])
-
-    cmd.extend([
+        base_cmd.extend(["-vf", sub_filter])
+    
+    # Encoding settings (ultrafast for speed, threads auto, faststart for streaming)
+    base_cmd.extend([
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-        "-c:a", "copy", "-progress", "pipe:1", output_path
+        "-threads", "auto",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        "-progress", "pipe:1", output_path
     ])
     
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    # ---------- FIX 2: Try with subtitles ----------
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *base_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+    except Exception:
+        # Fallback: command failed to start
+        fallback_cmd = ["ffmpeg", "-y", "-i", video_path, "-map", "0",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+                        "-threads", "auto",
+                        "-c:a", "copy",
+                        "-movflags", "+faststart",
+                        output_path]
+        process = await asyncio.create_subprocess_exec(
+            *fallback_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await safe_edit(status_msg, "⚠️ Subtitle corrupt or unsupported. Encoding without subtitles.")
+    
     current_encoding[user_id] = process
     
     last_update = 0
@@ -151,11 +186,31 @@ async def encode_with_progress(video_path, subtitle_path, output_path, total_dur
     returncode = await process.wait()
     current_encoding.pop(user_id, None)
     
-    if returncode != 0: raise Exception(f"FFmpeg failed with code {returncode}")
-    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024: raise Exception("Output file missing or too small")
+    # ---------- FIX 2 (Extended): Returncode check fallback ----------
+    if returncode != 0:
+        await safe_edit(status_msg, "⚠️ Subtitle error, retrying without subtitles...")
+        
+        fallback_cmd = ["ffmpeg", "-y", "-i", video_path, "-map", "0",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
+                        "-threads", "auto",
+                        "-c:a", "copy",
+                        "-movflags", "+faststart",
+                        output_path]
+        
+        fallback_proc = await asyncio.create_subprocess_exec(
+            *fallback_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await fallback_proc.wait()
+        if fallback_proc.returncode != 0:
+            raise Exception("FFmpeg failed even without subtitles")
+    
+    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
+        raise Exception("Output file missing or too small")
     return True
 
-# ================= HANDLERS =================
+# ================= HANDLERS (unchanged) =================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message: Message):
@@ -251,7 +306,6 @@ async def callback_queries(client, query: CallbackQuery):
     
     data = query.data
 
-    # Watermark Choices
     if data == "wm_yes":
         users_data[user_id]["state"] = "WAIT_WM_PIC"
         await query.message.edit("🖼️ Send the Watermark Image (Photo format).")
@@ -259,14 +313,10 @@ async def callback_queries(client, query: CallbackQuery):
         users_data[user_id]["watermark"] = None
         users_data[user_id]["state"] = "WAIT_RENAME_CHOICE"
         await ask_rename(query.message)
-    
-    # Watermark Position Choices
     elif data.startswith("pos_"):
         users_data[user_id]["wm_pos"] = "TL" if data == "pos_TL" else "TR"
         users_data[user_id]["state"] = "WAIT_RENAME_CHOICE"
         await ask_rename(query.message)
-
-    # Rename Choices
     elif data == "rn_yes":
         users_data[user_id]["state"] = "WAIT_RENAME_TEXT"
         await query.message.edit("📝 Send new name for the video (without extension)\n\nEx: [S01 - Ep 02] Oshi no Ko - HD")
@@ -323,7 +373,6 @@ async def worker():
             await safe_edit(status, "📥 Downloading video...")
             v_path = await download_with_verification(app, v_info["file_id"], status, "Downloading video")
 
-            # Limit increased to 2GB for Colab
             if os.path.getsize(v_path) > 2000 * 1024 * 1024:
                 await safe_edit(status, "❌ Video is larger than 2GB limit.")
                 continue
@@ -336,7 +385,10 @@ async def worker():
                 wm_path = await download_with_verification(app, wm_info["file_id"], status, "Downloading watermark")
 
             dur = await get_duration(v_path)
-            out_path = v_info["file_name"]
+            
+            # Safe output path in temp directory
+            out_path = os.path.join(tempfile.gettempdir(), v_info["file_name"])
+            
             await safe_edit(status, "🔥 Encoding...")
             
             success = await encode_with_progress(v_path, s_path, out_path, dur, status, uid, wm_path, wm_pos)
@@ -345,11 +397,11 @@ async def worker():
                 await safe_edit(status, "📤 Uploading as Document...")
                 upload_target = DEST_CHANNEL if DEST_CHANNEL else original_chat
                 
-                # SENDS STRICTLY AS DOCUMENT 📄
+                # FIX: caption only filename, not full path
                 await app.send_document(
                     chat_id=upload_target,
                     document=out_path,
-                    caption=f"{out_path}"
+                    caption=os.path.basename(out_path)
                 )
                 
                 await safe_edit(status, f"✅ Successfully Completed!\n\nFile Sent.")
