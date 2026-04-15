@@ -4,8 +4,8 @@ import json
 import asyncio
 import threading
 import tempfile
-import re
 import shutil
+import math
 from collections import deque
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -17,8 +17,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DEST_CHANNEL = ""   # Yaha channel ka username dena ya khali chhod dena.
-PORT = 10000        # ye change mat karna 
+DEST_CHANNEL = ""   
+PORT = 10000        
 
 OWNER_ID = 5351848105       
 ALLOWED_USERS = [5344078567]             
@@ -30,23 +30,35 @@ app = Client("EncoderBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 users_data = {}
 task_queue = deque()
 in_queue = set()
-processing_lock = asyncio.Lock()
 main_loop = None
 edit = "Maintanence by: @Sub_and_hardsub"
 
 current_encoding = {} 
+BANNED_USERS = set()      # Banned users ki list
+user_strikes = {}         # Strike count track karne ke liye
 
 # ================= UTILS =================
 
 def is_authorized(message: Message) -> bool:
     if not message.from_user: return False
     u_id = message.from_user.id    
+    if u_id in BANNED_USERS: return False
     if u_id == OWNER_ID or u_id in ALLOWED_USERS or message.chat.id in ALLOWED_GROUPS:
         return True
     return False
 
-def is_owner(message: Message) -> bool:
-    return message.from_user and message.from_user.id == OWNER_ID
+async def check_size_and_strike(message: Message, file_size: int, u_id: int) -> bool:
+    """Check if file is > 1GB. Manage strikes and bans."""
+    if file_size > 1073741824:  # 1GB
+        user_strikes[u_id] = user_strikes.get(u_id, 0) + 1
+        strikes = user_strikes[u_id]
+        if strikes >= 3:
+            BANNED_USERS.add(u_id)
+            await message.reply("🚫 **BANNED!**\nYou uploaded >1GB files 3 times. You can no longer use this bot.")
+        else:
+            await message.reply(f"⚠️ **WARNING ({strikes}/3)**\nFile is larger than 1GB! Bot only supports up to 1GB.\nNext warnings will result in a permanent ban.")
+        return False
+    return True
 
 async def get_duration(file):
     try:
@@ -55,169 +67,140 @@ async def get_duration(file):
         stdout, _ = await proc.communicate()
         data = json.loads(stdout.decode())
         return float(data.get("format", {}).get("duration", 0))
-    except:
-        return 0
+    except: return 0
 
 def format_progress_bar(percent, width=10):
     filled = int(percent * width / 100)
-    bar = "█" * filled + "░" * (width - filled)
-    return bar
+    return "█" * filled + "░" * (width - filled)
 
 async def safe_edit(message: Message, text: str):
-    try:
-        await message.edit(text)
-    except:
-        pass
+    try: await message.edit(text)
+    except: pass
 
-async def download_with_verification(client, file_id, status_msg, phase="Downloading"):
-    temp_dir = tempfile.gettempdir()
-    base_name = f"temp_{int(time.time())}_{file_id}"
-    
+async def download_with_verification(client, file_id, status_msg, workspace, file_name="file"):
+    path = os.path.join(workspace, file_name)
     for attempt in range(5):
-        temp_file = os.path.join(temp_dir, f"{base_name}_{attempt}")
         try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-                
-            path = await client.download_media(file_id, file_name=temp_file)
-            if path and os.path.exists(path) and os.path.getsize(path) > 0:
-                if phase == "Downloading video":
-                    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
-                    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                    await proc.communicate()
-                    if proc.returncode != 0: raise Exception("File corrupt")
-                return path
+            if os.path.exists(path): os.remove(path)
+            downloaded = await client.download_media(file_id, file_name=path)
+            if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
+                return downloaded
         except Exception as e:
             if attempt < 4:
-                await asyncio.sleep(5 * (attempt + 1))
+                await asyncio.sleep(5)
                 continue
             raise Exception(f"Download failed: {str(e)}")
     raise Exception("Download failed after 5 attempts")
 
-# ================= FINAL ENCODE FUNCTION (ALL FIXES + FAST) =================
-async def encode_with_progress(video_path, subtitle_path, output_path, total_duration, status_msg, user_id, wm_path=None, wm_pos=None):
-    # ---------- FIX 1: Preserve original subtitle extension ----------
-    ext = os.path.splitext(subtitle_path)[1]  # .srt or .ass
-    safe_sub = os.path.join(tempfile.gettempdir(), f"subtitle{ext}")
-    try:
-        shutil.copy(subtitle_path, safe_sub)
-    except:
-        safe_sub = subtitle_path   # fallback agar copy fail ho
+def calculate_target_bitrate(original_size_bytes, duration_secs, max_factor=1.5, hard_limit_mb=300):
+    """
+    Returns video bitrate in kbps such that final file size <= min(original_size * max_factor, hard_limit_mb MB)
+    """
+    max_allowed_bytes = min(original_size_bytes * max_factor, hard_limit_mb * 1024 * 1024)
+    # Audio size is unknown but we assume it's same as original (copied). We'll leave ~10% margin.
+    # Total size = video + audio. We'll set video bitrate to achieve 90% of max_allowed.
+    target_total_bytes = max_allowed_bytes * 0.9
+    video_bitrate_bps = (target_total_bytes * 8) / duration_secs
+    # Convert to kbps, ensure minimum 200 kbps
+    video_bitrate_kbps = max(200, int(video_bitrate_bps / 1000))
+    return video_bitrate_kbps
+
+# ================= CORE FFmpeg FUNCTIONS (with size control) =================
+async def resize_only(video_path, output_path, target_height, total_duration, status_msg, user_id, original_size_bytes):
+    scale_filter = f"scale=-2:{target_height}"
     
-    abs_sub = os.path.abspath(safe_sub).replace('\\', '/')
+    # Calculate bitrate to keep size under control
+    bitrate_kbps = calculate_target_bitrate(original_size_bytes, total_duration, max_factor=1.5, hard_limit_mb=300)
     
-    # Base command with mapping and faststart
-    base_cmd = ["ffmpeg", "-y", "-i", video_path, "-map", "0"]
-    
-    # Subtitle filter with UTF-8
-    sub_filter = f"subtitles='{abs_sub}':charenc=UTF-8"
-    
-    if wm_path:
-        base_cmd.extend(["-i", wm_path])
-        pos_x, pos_y = ("10", "10") if wm_pos == "TL" else ("W-w-10", "10")
-        filter_str = f"[0:v]{sub_filter}[sub];[1:v]scale=-1:60[wm];[sub][wm]overlay={pos_x}:{pos_y}"
-        base_cmd.extend(["-filter_complex", filter_str])
-    else:
-        base_cmd.extend(["-vf", sub_filter])
-    
-    # Encoding settings (ultrafast for speed, threads auto, faststart for streaming)
-    base_cmd.extend([
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-        "-threads", "auto",
-        "-c:a", "copy",
-        "-movflags", "+faststart",
-        "-progress", "pipe:1", output_path
-    ])
-    
-    # ---------- FIX 2: Try with subtitles ----------
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *base_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-    except Exception:
-        # Fallback: command failed to start
-        fallback_cmd = ["ffmpeg", "-y", "-i", video_path, "-map", "0",
-                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-                        "-threads", "auto",
-                        "-c:a", "copy",
-                        "-movflags", "+faststart",
-                        output_path]
-        process = await asyncio.create_subprocess_exec(
-            *fallback_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await safe_edit(status_msg, "⚠️ Subtitle corrupt or unsupported. Encoding without subtitles.")
-    
+    base_cmd = [
+        "ffmpeg", "-y", "-i", video_path, "-vf", scale_filter,
+        "-c:v", "libx264", "-preset", "superfast", "-b:v", f"{bitrate_kbps}k",
+        "-maxrate", f"{bitrate_kbps * 1.5}k", "-bufsize", f"{bitrate_kbps * 2}k",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy", "-progress", "pipe:1", output_path
+    ]
+    process = await asyncio.create_subprocess_exec(*base_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     current_encoding[user_id] = process
     
     last_update = 0
     progress_data = {}
-
+    
     async def read_stdout():
         nonlocal last_update
         while True:
             line = await process.stdout.readline()
             if not line: break
             line_str = line.decode(errors="ignore").strip()
-            if "=" in line_str:
-                key, val = line_str.split("=", 1)
-                progress_data[key] = val
+            if "=" in line_str: key, val = line_str.split("=", 1); progress_data[key] = val
             if key == "out_time_ms":
                 try:
-                    ms = int(progress_data.get("out_time_ms", 0))
-                    current_seconds = ms / 1_000_000.0
-                    percent = (current_seconds / total_duration) * 100 if total_duration > 0 else 0
-                    now = time.time()
-                    if now - last_update > 5 or percent >= 100:
-                        bar = format_progress_bar(percent)
-                        await safe_edit(status_msg, f"🔥 Encoding...\n`{bar}` {percent:.1f}%")
-                        last_update = now
+                    percent = ((int(progress_data.get("out_time_ms", 0)) / 1_000_000.0) / total_duration) * 100
+                    if time.time() - last_update > 5:
+                        await safe_edit(status_msg, f"🔄 Resizing...\n`{format_progress_bar(percent)}` {percent:.1f}%")
+                        last_update = time.time()
                 except: pass
-
-    async def read_stderr():
-        while True:
-            line = await process.stderr.readline()
-            if not line: break
-
-    await asyncio.gather(read_stdout(), read_stderr())
+    
+    await asyncio.gather(read_stdout(), process.stderr.read())
     returncode = await process.wait()
     current_encoding.pop(user_id, None)
-    
-    # ---------- FIX 2 (Extended): Returncode check fallback ----------
-    if returncode != 0:
-        await safe_edit(status_msg, "⚠️ Subtitle error, retrying without subtitles...")
-        
-        fallback_cmd = ["ffmpeg", "-y", "-i", video_path, "-map", "0",
-                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24",
-                        "-threads", "auto",
-                        "-c:a", "copy",
-                        "-movflags", "+faststart",
-                        output_path]
-        
-        fallback_proc = await asyncio.create_subprocess_exec(
-            *fallback_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await fallback_proc.wait()
-        if fallback_proc.returncode != 0:
-            raise Exception("FFmpeg failed even without subtitles")
-    
-    if not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
-        raise Exception("Output file missing or too small")
+    if returncode != 0: raise Exception("Resize failed")
     return True
 
-# ================= HANDLERS (unchanged) =================
+async def encode_with_progress(video_path, subtitle_path, output_path, total_duration, status_msg, user_id, original_size_bytes, wm_path=None, wm_pos=None):
+    abs_sub = os.path.abspath(subtitle_path).replace('\\', '/')
+    sub_filter = f"subtitles='{abs_sub}':charenc=UTF-8"
+    
+    # Calculate bitrate to keep final size under control
+    bitrate_kbps = calculate_target_bitrate(original_size_bytes, total_duration, max_factor=1.5, hard_limit_mb=300)
+    
+    if wm_path:
+        overlay_pos = "20:20" if wm_pos == "TL" else "W-w-20:20"
+        filter_complex = f"[0:v]{sub_filter}[sub];[1:v]scale=200:-1[wm];[sub][wm]overlay={overlay_pos}"
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-i", wm_path, "-filter_complex", filter_complex]
+    else:
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", sub_filter]
+    
+    cmd.extend([
+        "-c:v", "libx264", "-preset", "superfast",
+        "-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps * 1.5}k", "-bufsize", f"{bitrate_kbps * 2}k",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy", "-progress", "pipe:1", output_path
+    ])
+    
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    current_encoding[user_id] = process
+    
+    last_update = 0
+    progress_data = {}
+    
+    async def read_stdout():
+        nonlocal last_update
+        while True:
+            line = await process.stdout.readline()
+            if not line: break
+            line_str = line.decode(errors="ignore").strip()
+            if "=" in line_str: key, val = line_str.split("=", 1); progress_data[key] = val
+            if key == "out_time_ms":
+                try:
+                    percent = ((int(progress_data.get("out_time_ms", 0)) / 1_000_000.0) / total_duration) * 100
+                    if time.time() - last_update > 5:
+                        await safe_edit(status_msg, f"🔥 Encoding...\n`{format_progress_bar(percent)}` {percent:.1f}%")
+                        last_update = time.time()
+                except: pass
+                
+    await asyncio.gather(read_stdout(), process.stderr.read())
+    returncode = await process.wait()
+    current_encoding.pop(user_id, None)
+    if returncode != 0: raise Exception("FFmpeg failed")
+    return True
 
+# ================= HANDLERS =================
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message: Message):
     if not is_authorized(message): return
-    await message.reply(f"<b>🔥 Hardsub bot is Online again!</b>\n\nUse /hsub to add subtitle into video\nUse /cancel to stop task\n\n{edit}")
+    await message.reply(f"<b>🔥 Hardsub bot is Online!</b>\n\n/hsub - Add subtitle\n/remm or /cancel - Stop task & clear data\n/1080pdd, /720pdd, /480pdd - Resize\n\n{edit}")
 
-@app.on_message(filters.command("cancel"))
+@app.on_message(filters.command(["cancel", "remm"]))
 async def cancel_task(client, message: Message):
     if not is_authorized(message): return
     user_id = message.from_user.id
@@ -233,217 +216,160 @@ async def cancel_task(client, message: Message):
         proc = current_encoding[user_id]
         try:
             proc.terminate()
-            await asyncio.wait_for(proc.wait(), timeout=5)
+            await asyncio.wait_for(proc.wait(), timeout=3)
         except:
             proc.kill()
         current_encoding.pop(user_id, None)
-        await message.reply("🛑 Your encoding task has been cancelled.")
+        await message.reply("🛑 Task Force Stopped! All temp data deleted.")
         return
     
     if removed:
         in_queue.discard(user_id)
-        await message.reply("✅ Your task has been removed from queue.")
+        await message.reply("✅ Task removed from queue and data cleared.")
     else:
         await message.reply("❌ No active task found.")
+
+@app.on_message(filters.command(["1080pdd", "720pdd", "480pdd"]) & filters.private)
+async def resize_command(client, message: Message):
+    if not is_authorized(message): return
+    target = int(message.command[0].replace("pdd", ""))
+    
+    media = message.reply_to_message.video or message.reply_to_message.document if message.reply_to_message else None
+    if not media: return await message.reply("❌ Please reply to a video file.")
+    
+    if not await check_size_and_strike(message, media.file_size, message.from_user.id): return
+    
+    status = await message.reply(f"⏳ Resizing to {target}p ...")
+    workspace = os.path.join(tempfile.gettempdir(), f"resize_{message.from_user.id}_{int(time.time())}")
+    os.makedirs(workspace, exist_ok=True)
+    
+    try:
+        v_path = await download_with_verification(app, media.file_id, status, workspace, "input.mp4")
+        out_path = os.path.join(workspace, f"resized_{target}p.mp4")
+        dur = await get_duration(v_path)
+        # Pass original file size for bitrate calculation
+        await resize_only(v_path, out_path, target, dur, status, message.from_user.id, media.file_size)
+        
+        await safe_edit(status, "📤 Uploading as Document...")
+        await app.send_document(chat_id=message.chat.id, document=out_path, caption=f"✅ Resized to {target}p")
+        await status.delete()
+    except Exception as e:
+        if str(e) != "Resize failed": await safe_edit(status, f"❌ Error: {str(e)}")
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 @app.on_message(filters.command("hsub"))
 async def hsub_cmd(client, message: Message):
     if not is_authorized(message): return
-    replied = message.reply_to_message
-    if not replied or not (replied.video or replied.document):
-        return await message.reply("❌ Reply to a video file with /hsub")
+    media = message.reply_to_message.video or message.reply_to_message.document if message.reply_to_message else None
+    if not media: return await message.reply("❌ Reply to a video file.")
     
-    media = replied.video or replied.document
-    users_data[message.from_user.id] = {
-        "video": {"file_id": media.file_id, "file_name": media.file_name or "video.mp4"},
-        "chat_id": message.chat.id,
-        "state": "WAIT_SUB"
-    }
-    await message.reply("📄 Now send the Subtitle file (.srt / .ass)")
+    if not await check_size_and_strike(message, media.file_size, message.from_user.id): return
+    
+    users_data[message.from_user.id] = {"video": {"file_id": media.file_id, "file_name": media.file_name or "video.mp4", "file_size": media.file_size}, "chat_id": message.chat.id, "state": "WAIT_SUB"}
+    await message.reply("📄 Send Subtitle file (.srt / .ass)")
 
 @app.on_message(filters.document | filters.video | filters.photo | filters.text)
-async def handle_all_inputs(client, message: Message):
+async def handle_inputs(client, message: Message):
     if not is_authorized(message): return
-    user_id = message.from_user.id
-    if user_id not in users_data: return
+    uid = message.from_user.id
+    if uid not in users_data: return
+    state = users_data[uid].get("state")
 
-    state = users_data[user_id].get("state")
+    if state == "WAIT_SUB" and message.document and message.document.file_name.endswith((".srt", ".ass")):
+        users_data[uid]["subtitle"] = {"file_id": message.document.file_id, "file_name": message.document.file_name}
+        users_data[uid]["state"] = "WAIT_WM_CHOICE"
+        await message.reply("Add Watermark?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Yes", callback_data="wm_yes"), InlineKeyboardButton("No", callback_data="wm_skip")]]))
+        
+    elif state == "WAIT_WM_PIC" and message.photo:
+        users_data[uid]["watermark"] = {"file_id": message.photo.file_id}
+        users_data[uid]["state"] = "WAIT_WM_POS"
+        await message.reply("Position:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Top-Left", callback_data="pos_TL"), InlineKeyboardButton("Top-Right", callback_data="pos_TR")]]))
 
-    if state == "WAIT_SUB" and message.document:
-        if message.document.file_name.lower().endswith((".srt", ".ass")):
-            users_data[user_id]["subtitle"] = {"file_id": message.document.file_id, "file_name": message.document.file_name}
-            users_data[user_id]["state"] = "WAIT_WM_CHOICE"
-            
-            btn = InlineKeyboardMarkup([[
-                InlineKeyboardButton("Yes, Add Photo", callback_data="wm_yes"),
-                InlineKeyboardButton("Skip Watermark", callback_data="wm_skip")
-            ]])
-            await message.reply("Do you want to add a Watermark Image (Logo)?", reply_markup=btn)
-        return
-
-    if state == "WAIT_WM_PIC" and message.photo:
-        users_data[user_id]["watermark"] = {"file_id": message.photo.file_id}
-        users_data[user_id]["state"] = "WAIT_WM_POS"
-        btn = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Top-Left", callback_data="pos_TL"),
-            InlineKeyboardButton("Top-Right", callback_data="pos_TR")
-        ]])
-        await message.reply("Select Watermark Position:", reply_markup=btn)
-        return
-
-    if state == "WAIT_RENAME_TEXT" and message.text:
-        new_name = message.text.strip()
-        if not new_name.endswith(".mp4"): new_name += ".mp4"
-        users_data[user_id]["video"]["file_name"] = new_name
-        await add_to_queue(user_id, message)
-        return
+    elif state == "WAIT_RENAME_TEXT" and message.text:
+        users_data[uid]["video"]["file_name"] = message.text.strip() + ".mp4" if not message.text.endswith(".mp4") else message.text.strip()
+        await add_to_queue(uid, message)
 
 @app.on_callback_query()
-async def callback_queries(client, query: CallbackQuery):
-    user_id = query.from_user.id
-    if user_id not in users_data:
-        return await query.answer("Not Yours!", show_alert=True)
-    
-    data = query.data
+async def callbacks(client, query: CallbackQuery):
+    uid = query.from_user.id
+    if uid not in users_data: return await query.answer("Not Yours!", show_alert=True)
+    d = query.data
+    if d == "wm_yes":
+        users_data[uid]["state"] = "WAIT_WM_PIC"; await query.message.edit("🖼️ Send Photo.")
+    elif d == "wm_skip":
+        users_data[uid]["watermark"] = None; users_data[uid]["state"] = "WAIT_RENAME_CHOICE"; await ask_rename(query.message)
+    elif d.startswith("pos_"):
+        users_data[uid]["wm_pos"] = "TL" if d == "pos_TL" else "TR"; users_data[uid]["state"] = "WAIT_RENAME_CHOICE"; await ask_rename(query.message)
+    elif d == "rn_yes":
+        users_data[uid]["state"] = "WAIT_RENAME_TEXT"; await query.message.edit("📝 Send new name.")
+    elif d == "rn_skip":
+        users_data[uid]["video"]["file_name"] = os.path.splitext(users_data[uid]["video"]["file_name"])[0] + ".mp4"; await add_to_queue(uid, query.message)
 
-    if data == "wm_yes":
-        users_data[user_id]["state"] = "WAIT_WM_PIC"
-        await query.message.edit("🖼️ Send the Watermark Image (Photo format).")
-    elif data == "wm_skip":
-        users_data[user_id]["watermark"] = None
-        users_data[user_id]["state"] = "WAIT_RENAME_CHOICE"
-        await ask_rename(query.message)
-    elif data.startswith("pos_"):
-        users_data[user_id]["wm_pos"] = "TL" if data == "pos_TL" else "TR"
-        users_data[user_id]["state"] = "WAIT_RENAME_CHOICE"
-        await ask_rename(query.message)
-    elif data == "rn_yes":
-        users_data[user_id]["state"] = "WAIT_RENAME_TEXT"
-        await query.message.edit("📝 Send new name for the video (without extension)\n\nEx: [S01 - Ep 02] Oshi no Ko - HD")
-    elif data == "rn_skip":
-        base = os.path.splitext(users_data[user_id]["video"]["file_name"])[0]
-        users_data[user_id]["video"]["file_name"] = base + ".mp4"
-        await query.message.edit("🚀 Processing with original name...")
-        await add_to_queue(user_id, query.message)
+async def ask_rename(msg):
+    await msg.edit("Rename file?", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Yes", callback_data="rn_yes"), InlineKeyboardButton("Skip", callback_data="rn_skip")]]))
 
-async def ask_rename(message):
-    btn = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Rename", callback_data="rn_yes"),
-        InlineKeyboardButton("Skip", callback_data="rn_skip")
-    ]])
-    await message.edit("Do you want to rename the output file?", reply_markup=btn)
+async def add_to_queue(uid, msg):
+    d = users_data.pop(uid)
+    task_queue.append({"user_id": uid, "video": d.get("video"), "subtitle": d.get("subtitle"), "watermark": d.get("watermark"), "wm_pos": d.get("wm_pos"), "chat_id": d.get("chat_id")})
+    in_queue.add(uid)
+    await msg.reply(f"✅ Added to Queue. Position: {len(task_queue)}")
 
-async def add_to_queue(user_id, message):
-    data = users_data.pop(user_id)
-    task_queue.append({
-        "user_id": user_id,
-        "video": data.get("video"),
-        "subtitle": data.get("subtitle"),
-        "watermark": data.get("watermark"),
-        "wm_pos": data.get("wm_pos"),
-        "chat_id": data.get("chat_id")
-    })
-    in_queue.add(user_id)
-    await message.reply(f"✅ Added to Queue. Position: {len(task_queue)}")
-
-# ================= CORE ENCODER =================
-
+# ================= WORKER =================
 async def worker():
     while True:
         if not task_queue:
-            await asyncio.sleep(5)
-            continue
+            await asyncio.sleep(5); continue
         
         task = task_queue.popleft()
-        uid = task["user_id"]
-        v_info = task["video"]
-        s_info = task["subtitle"]
-        wm_info = task.get("watermark")
-        wm_pos = task.get("wm_pos")
-        original_chat = task["chat_id"]
+        uid, v_info, s_info, wm_info, wm_pos, chat = task["user_id"], task["video"], task["subtitle"], task.get("watermark"), task.get("wm_pos"), task["chat_id"]
+        status = await app.send_message(chat, "⏳ Starting Process...")
         
-        status = await app.send_message(original_chat, "⏳ Starting Process...")
-        channel_log = None
-        v_path = s_path = wm_path = out_path = None
+        workspace = os.path.join(tempfile.gettempdir(), f"task_{uid}_{int(time.time())}")
+        os.makedirs(workspace, exist_ok=True)
         
         try:
-            if DEST_CHANNEL:
-                channel_log = await app.send_message(DEST_CHANNEL, f"<b>🔄 Starting:</b> {v_info['file_name']}")
-
             await safe_edit(status, "📥 Downloading video...")
-            v_path = await download_with_verification(app, v_info["file_id"], status, "Downloading video")
-
-            if os.path.getsize(v_path) > 2000 * 1024 * 1024:
-                await safe_edit(status, "❌ Video is larger than 2GB limit.")
-                continue
-
+            v_path = await download_with_verification(app, v_info["file_id"], status, workspace, "input.mp4")
+            original_size = v_info.get("file_size", os.path.getsize(v_path))
+            
             await safe_edit(status, "📥 Downloading subtitle...")
-            s_path = await download_with_verification(app, s_info["file_id"], status, "Downloading subtitle")
+            s_ext = os.path.splitext(s_info["file_name"])[1]
+            s_path = await download_with_verification(app, s_info["file_id"], status, workspace, f"sub{s_ext}")
+            
+            wm_path = None
+            if wm_info: 
+                wm_path = await download_with_verification(app, wm_info["file_id"], status, workspace, "wm.jpg")
 
-            if wm_info:
-                await safe_edit(status, "📥 Downloading watermark...")
-                wm_path = await download_with_verification(app, wm_info["file_id"], status, "Downloading watermark")
-
+            out_path = os.path.join(workspace, v_info["file_name"])
+            await safe_edit(status, "🔥 Encoding...")
             dur = await get_duration(v_path)
             
-            # Safe output path in temp directory
-            out_path = os.path.join(tempfile.gettempdir(), v_info["file_name"])
-            
-            await safe_edit(status, "🔥 Encoding...")
-            
-            success = await encode_with_progress(v_path, s_path, out_path, dur, status, uid, wm_path, wm_pos)
+            await encode_with_progress(v_path, s_path, out_path, dur, status, uid, original_size, wm_path, wm_pos)
 
-            if success:
-                await safe_edit(status, "📤 Uploading as Document...")
-                upload_target = DEST_CHANNEL if DEST_CHANNEL else original_chat
-                
-                # FIX: caption only filename, not full path
-                await app.send_document(
-                    chat_id=upload_target,
-                    document=out_path,
-                    caption=os.path.basename(out_path)
-                )
-                
-                await safe_edit(status, f"✅ Successfully Completed!\n\nFile Sent.")
-                if channel_log: await channel_log.delete()
-            else:
-                await safe_edit(status, "❌ Encoding Failed.")
-                
+            await safe_edit(status, "📤 Uploading Document...")
+            await app.send_document(chat_id=DEST_CHANNEL or chat, document=out_path, caption=v_info['file_name'])
+            await status.delete()
         except Exception as e:
-            await app.send_message(original_chat, f"❌ Error: {str(e)}")
+            if str(e) != "FFmpeg failed": await app.send_message(chat, f"❌ Error: {str(e)}")
         finally:
             in_queue.discard(uid)
-            for f in [v_path, s_path, wm_path, out_path]:
-                if f and os.path.exists(f):
-                    try: os.remove(f)
-                    except: pass
+            shutil.rmtree(workspace, ignore_errors=True)
 
-# ================= RENDER KEEP ALIVE =================
-
+# ================= HEALTH SERVER =================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is Running")
 
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
-
-# ================= MAIN =================
-
 async def main():
-    if edit != "Maintanence by: @Sub_and_hardsub":
-        print("credit hataya isiliye nahi chala. Sahi karo wo pehele.")
-        return
-    global main_loop
-    main_loop = asyncio.get_event_loop()
+    if edit != "Maintanence by: @Sub_and_hardsub": return
     await app.start()
     print("Bot is started!")
     asyncio.create_task(worker())
     await idle()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_health_server, daemon=True).start()
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(), daemon=True).start()
+    asyncio.get_event_loop().run_until_complete(main())
