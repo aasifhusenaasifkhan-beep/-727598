@@ -27,7 +27,7 @@ app = Client("EncoderBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 users_data = {}
 task_queue = deque()
 in_queue = set()
-cancelled_tasks = set() # NEW: Track cancelled tasks
+cancelled_tasks = set()
 edit = "Maintanence by: @Sub_and_hardsub"
 current_encoding = {} 
 BANNED_USERS = set()
@@ -71,7 +71,6 @@ async def safe_edit(message: Message, text: str):
     try: await message.edit(text)
     except: pass
 
-# Added cancellation check during download
 async def download_with_verification(client, file_id, status_msg, workspace, user_id, file_name="file"):
     path = os.path.join(workspace, file_name)
     
@@ -96,12 +95,13 @@ async def download_with_verification(client, file_id, status_msg, workspace, use
 
 # ================= FAST ENCODE FUNCTIONS =================
 async def resize_only(video_path, output_path, target_height, total_duration, status_msg, user_id):
-    # CHANGED: veryfast + CRF 30 + Audio compression (AAC 128k) for smaller file sizes
     scale_filter = f"scale=-2:{target_height}"
+    
+    # MAXIMUM SPEED (ultrafast) + BETTER COMPRESSION (CRF 34 & Audio 96k)
     cmd = [
         "ffmpeg", "-y", "-i", video_path, "-vf", scale_filter,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "34",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
         "-progress", "pipe:1", output_path
     ]
     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -145,10 +145,10 @@ async def encode_with_progress(video_path, subtitle_path, output_path, total_dur
     else:
         cmd = ["ffmpeg", "-y", "-i", video_path, "-vf", sub_filter]
     
-    # CHANGED: veryfast + CRF 30 + AAC audio for better compression
+    # MAXIMUM SPEED (ultrafast) + BETTER COMPRESSION (CRF 34 & Audio 96k)
     cmd.extend([
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-tune", "fastdecode",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "34", "-tune", "fastdecode",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
         "-progress", "pipe:1", output_path
     ])
     
@@ -184,11 +184,10 @@ async def encode_with_progress(video_path, subtitle_path, output_path, total_dur
     return True
 
 # ================= HANDLERS =================
-# REMOVED: `& filters.private` so it works in groups too
 @app.on_message(filters.command("start"))
 async def start(client, message: Message):
     if not is_authorized(message): return
-    await message.reply(f"<b>🔥 Hardsub bot (Fast + Compressed)</b>\n\n/hsub - Add subtitle\n/cancel - Stop task\n/1080pdd, /720pdd, /480pdd - Resize\n\n{edit}")
+    await message.reply(f"<b>🔥 Hardsub bot (UltraFast + Compressed)</b>\n\n/hsub - Add subtitle\n/cancel - Stop task\n/1080pdd, /720pdd, /480pdd - Resize\n\n{edit}")
 
 @app.on_message(filters.command(["cancel", "remm"]))
 async def cancel_task(client, message: Message):
@@ -196,19 +195,16 @@ async def cancel_task(client, message: Message):
     user_id = message.from_user.id
     removed = False
     
-    # 1. Check if user is in input stage
     if user_id in users_data:
         del users_data[user_id]
         removed = True
 
-    # 2. Check queue
     for i, task in enumerate(task_queue):
         if task["user_id"] == user_id:
             del task_queue[i]
             removed = True
             break
             
-    # 3. Stop running tasks (Download/Encode)
     cancelled_tasks.add(user_id)
     if user_id in current_encoding:
         proc = current_encoding[user_id]
@@ -289,7 +285,6 @@ async def handle_inputs(client, message: Message):
 @app.on_callback_query()
 async def callbacks(client, query: CallbackQuery):
     uid = query.from_user.id
-    # Ensure only the user who started the task can click the buttons
     if uid not in users_data: return await query.answer("Ye aapka task nahi hai!", show_alert=True)
     d = query.data
     if d == "wm_yes":
@@ -369,7 +364,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 async def main():
     if edit != "Maintanence by: @Sub_and_hardsub": return
     await app.start()
-    print("Bot started with VERYFAST + AAC 128k (Fixed group commands & cancel)")
+    print("Bot started with ULTRAFAST + CRF34 (Max Speed + High Compression)")
     asyncio.create_task(worker())
     await idle()
 
